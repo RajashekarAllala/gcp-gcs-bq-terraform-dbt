@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Defaulters>
+  <Defaulter>
+    <Loan_ID>L000008</Loan_ID>
+    <Cust_Name>Manoj Chowdhury</Cust_Name>
+    <Loan_Amount>413857.34</Loan_Amount>
+    <Int_Rate>7.03</Int_Rate>
+    <Instalments>12</Instalments>
+    <Start_Date>2021-07-04</Start_Date>
+    <End_Date>2022-07-04</End_Date>
+    <Status>Default</Status>
+    <is_default>True</is_default>
+  </Defaulter>
+  <Defaulter>
+    <Loan_ID>L000112</Loan_ID>
+    <Cust_Name>Lakshmi Joshi</Cust_Name>
+    <Loan_Amount>465566.21</Loan_Amount>
+    <Int_Rate>16.63</Int_Rate>
+    <Instalments>24</Instalments>
+    <Start_Date>2025-09-07</Start_Date>
+    <End_Date>2027-09-07</End_Date>
+    <Status>Default</Status>
+    <is_default>True</is_default>
+  </Defaulter>
+  <Defaulter>
+    <Loan_ID>L000172</Loan_ID>
+    <Cust_Name>Kavita Gupta</Cust_Name>
+    <Loan_Amount>80194.95</Loan_Amount>
+    <Int_Rate>12.01</Int_Rate>
+    <Instalments>36</Instalments>
+    <Start_Date>2018-05-16</Start_Date>
+    <End_Date>2021-05-16</End_Date>
+    <Status>Default</Status>
+    <is_default>True</is_default>
+  </Defaulter>
+  <Defaulter>
+    <Loan_ID>L000105</Loan_ID>
+    <Cust_Name>Kiran Rao</Cust_Name>
+    <Loan_Amount>332209.58</Loan_Amount>
+    <Int_Rate>12.75</Int_Rate>
+    <Instalments>48</Instalments>
+    <Start_Date>2023-04-06</Start_Date>
+    <End_Date>2027-04-06</End_Date>
+    <Status>Default</Status>
+    <is_default>True</is_default>
+  </Defaulter>
+  <Defaulter>
+    <Loan_ID>L000014</Loan_ID>
+    <Cust_Name>Asha Singh</Cust_Name>
+    <Loan_Amount>33538.26</Loan_Amount>
+    <Int_Rate>20.65</Int_Rate>
+    <Instalments>48</Instalments>
+    <Start_Date>2025-06-13</Start_Date>
+    <End_Date>2029-06-13</End_Date>
+    <Status>Default</Status>
+    <is_default>True</is_default>
+  </Defaulter>
+  <Defaulter>
+    <Loan_ID>L000097</Loan_ID>
+    <Cust_Name>Priya Khan</Cust_Name>
+    <Loan_Amount>130161.52</Loan_Amount>
+    <Int_Rate>8.64</Int_Rate>
+    <Instalments>60</Instalments>
+    <Start_Date>2020-03-20</Start_Date>
+    <End_Date>2025-03-20</End_Date>
+    <Status>Default</Status>
+    <is_default>True</is_default>
+  </Defaulter>
+  <Defaulter>
+    <Loan_ID>L000195</Loan_ID>
+    <Cust_Name>Kiran Desai</Cust_Name>
+    <Loan_Amount>292614.47</Loan_Amount>
+    <Int_Rate>13.27</Int_Rate>
+    <Instalments>60</Instalments>
+    <Start_Date>2018-06-08</Start_Date>
+    <End_Date>2023-06-08</End_Date>
+    <Status>Default</Status>
+    <is_default>True</is_default>
+  </Defaulter>
+  <Defaulter>
+    <Loan_ID>L000161</Loan_ID>
+    <Cust_Name>Kiran Khan</Cust_Name>
+    <Loan_Amount>322422.86</Loan_Amount>
+    <Int_Rate>12.05</Int_Rate>
+    <Instalments>96</Instalments>
+    <Start_Date>2022-09-19</Start_Date>
+    <End_Date>2030-09-19</End_Date>
+    <Status>Default</Status>
+    <is_default>True</is_default>
+  </Defaulter>
+</Defaulters>

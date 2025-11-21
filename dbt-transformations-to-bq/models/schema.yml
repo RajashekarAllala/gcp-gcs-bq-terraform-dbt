@@ -1,0 +1,53 @@
+version: 2
+
+sources:
+  - name: cl_staging                    # source name used in the model above
+    database: student-00332             # BigQuery project id (database)
+    schema: CL_STAGING                  # BigQuery dataset (schema)
+    tables:
+      - name: loans
+        description: "Raw loans table in student-00332.CL_STAGING.loans"
+        columns:
+          - name: Loan_ID
+            description: "Primary loan identifier"
+          - name: Cust_Name
+          - name: Loan_Amount
+          - name: Int_Rate
+          - name: Instalments
+          - name: Start_Date
+          - name: End_Date
+          - name: Status
+
+models:  
+  - name: defaulters # model name
+    description: "Defaulters transformed table derived from loans (incremental)."
+    config:
+      materialized: table
+      database: student-00332 # GCP project name
+      schema: CL_TRANSFORMED # dataset name
+      unique_key: Loan_ID
+    columns:
+      - name: Loan_ID
+        description: "Loan unique identifier (from loans)"
+        tests:
+          - not_null
+          - unique     
+      - name: Cust_Name
+        description: "Customer name"
+      - name: Loan_Amount
+        description: "Loan principal amount"
+      - name: Int_Rate
+        description: "Interest rate"
+      - name: Instalments
+        description: "Number of instalments"
+      - name: Start_Date
+        description: "Loan start date"
+      - name: End_Date
+        description: "Loan end date"
+      - name: Status
+        description: "Loan status"
+    tests:
+      - table_exists:
+          arguments:
+            project: student-00332
+            dataset: CL_TRANSFORMED
