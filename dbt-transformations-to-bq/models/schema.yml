@@ -2,11 +2,11 @@ version: 2
 
 sources:
   - name: cl_staging                    # source name used in the model above
-    database: student-00332             # BigQuery project id (database)
+    database: student-00380             # BigQuery project id (database)
     schema: CL_STAGING                  # BigQuery dataset (schema)
     tables:
       - name: loans
-        description: "Raw loans table in student-00332.CL_STAGING.loans"
+        description: "Raw loans table in student-00380.CL_STAGING.loans"
         columns:
           - name: Loan_ID
             description: "Primary loan identifier"
@@ -23,7 +23,7 @@ models:
     description: "Defaulters transformed table derived from loans (incremental)."
     config:
       materialized: table
-      database: student-00332 # GCP project name
+      database: student-00380 # GCP project name
       schema: CL_TRANSFORMED # dataset name
       unique_key: Loan_ID
     columns:
@@ -49,5 +49,5 @@ models:
     tests:
       - table_exists:
           arguments:
-            project: student-00332
+            project: student-00380
             dataset: CL_TRANSFORMED

@@ -17,7 +17,7 @@ Requirements:
 
 Examples:
     # Export only
-    python bq_to_xml.py --project student-00571 --dataset CL_TRANSFORMED --table defaulters --out defaulters.xml
+    python bq_to_xml_local_gcs.py --project student-00571 --dataset CL_TRANSFORMED --table defaulters --out defaulters.xml
 
     # Export and upload (normal)
     python bq_to_xml.py --project student-00571 --dataset CL_TRANSFORMED --table defaulters --upload --bucket ikl-finance-bucket-002
