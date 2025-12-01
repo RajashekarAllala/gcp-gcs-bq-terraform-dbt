@@ -1,0 +1,1520 @@
+Nice — below you'll find a ready-to-run Airflow DAG (Airflow 2 / Google provider) that reads a CSV file from a specific folder in a GCS bucket and loads it into a BigQuery table. I included:
+
+a simple, clear DAG for the common case (single CSV file path you know),
+
+explanations of params you must set (project, bucket, dataset, table, service account),
+
+recommended IAM roles / permissions for the service account,
+
+notes and options for multiple files / folder ingestion and schema handling,
+
+how to configure the Airflow connection / credentials.
+
+1) Simple DAG — single CSV file in a specific folder
+# airflow_gcs_to_bq_dag.py
+from datetime import datetime, timedelta
+
+from airflow import DAG
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from airflow.providers.google.cloud.sensors.gcs import GCSObjectExistenceSensor
+
+# === USER - change these ===
+PROJECT_ID = "my-gcp-project-123"                    # GCP project id
+GCS_BUCKET = "my-data-bucket"                        # bucket name
+GCS_FOLDER = "incoming/finance"                      # folder/prefix inside bucket
+CSV_FILENAME = "daily_transactions_2025-11-30.csv"   # file inside the folder
+BQ_DATASET = "staging_dataset"                       # BigQuery dataset
+BQ_TABLE = "transactions_staging"                    # BigQuery table name
+SERVICE_ACCOUNT_EMAIL = "airflow-sa@my-gcp-project-123.iam.gserviceaccount.com"
+
+# Derived values
+GCS_OBJECT_PATH = f"{GCS_FOLDER}/{CSV_FILENAME}"
+DEST_TABLE = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+
+default_args = {
+    "owner": "data-engineer",
+    "depends_on_past": False,
+    "email_on_failure": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id="gcs_csv_to_bigquery_simple",
+    default_args=default_args,
+    start_date=datetime(2025, 1, 1),
+    schedule_interval=None,            # trigger manually or via schedule
+    catchup=False,
+    tags=["gcs", "bigquery", "etl"],
+) as dag:
+
+    # optional sensor: waits till object exists in the bucket
+    wait_for_file = GCSObjectExistenceSensor(
+        task_id="wait_for_csv_file",
+        bucket=GCS_BUCKET,
+        object=GCS_OBJECT_PATH,
+        google_cloud_conn_id="google_cloud_default",
+        timeout=60 * 60,     # seconds to wait
+        poke_interval=60,    # check every 60s
+        mode="poke",
+    )
+
+    load_csv_to_bq = GCSToBigQueryOperator(
+        task_id="gcs_to_bigquery_load",
+        bucket=GCS_BUCKET,
+        source_objects=[GCS_OBJECT_PATH],   # list of objects under bucket
+        destination_project_dataset_table=DEST_TABLE,
+        schema_fields=None,                 # set schema_fields or use autodetect
+        source_format="CSV",
+        skip_leading_rows=1,                # header in CSV
+        write_disposition="WRITE_APPEND",   # or WRITE_TRUNCATE
+        create_disposition="CREATE_IF_NEEDED",
+        autodetect=True,                    # let BQ detect schema (or set schema_fields)
+        google_cloud_conn_id="google_cloud_default",
+        # optional: if you want the operator to impersonate a SA:
+        # impersonation_chain=[SERVICE_ACCOUNT_EMAIL],
+    )
+
+    wait_for_file >> load_csv_to_bq
+
+
+How to use:
+
+Put the DAG file into your Airflow DAGs folder.
+
+Set PROJECT_ID, GCS_BUCKET, GCS_FOLDER, CSV_FILENAME, BQ_DATASET, BQ_TABLE, and the SERVICE_ACCOUNT_EMAIL to values for your environment.
+
+The DAG waits for the object, then loads it to BigQuery using GCSToBigQueryOperator.
+
+2) Key operator options explained
+
+source_objects: list of object names relative to the bucket. Example ["incoming/finance/daily.csv"].
+
+destination_project_dataset_table: fully qualified BQ table project.dataset.table.
+
+autodetect=True will let BigQuery infer schema. For stable schemas provide schema_fields=[{"name":"id","type":"INTEGER","mode":"REQUIRED"}, ...].
+
+skip_leading_rows=1 if CSV has a header.
+
+write_disposition:
+
+WRITE_APPEND — append rows to existing table
+
+WRITE_TRUNCATE — replace table
+
+WRITE_EMPTY — fail if table not empty
+
+create_disposition:
+
+CREATE_IF_NEEDED — create table if not present
+
+CREATE_NEVER — fail if table missing
+
+3) Required Service Account + IAM roles (minimum recommended)
+
+You will run Airflow tasks using either:
+
+a GCP connection that provides a service account key (by google_cloud_default connection), or
+
+workload identity / impersonation if on Cloud Composer (recommended).
+
+Minimum IAM roles the service account must have:
+
+On the GCS bucket (or project)
+
+roles/storage.objectViewer — read objects from the bucket
+
+roles/storage.objectLister — list objects in the bucket (if your DAG lists folder contents)
+
+On BigQuery
+
+roles/bigquery.dataEditor (can INSERT/UPDATE) or roles/bigquery.dataOwner (wider) for the dataset/table
+
+roles/bigquery.jobUser — create and run BigQuery load jobs
+
+(optional) roles/bigquery.admin — only if you need full admin actions (not recommended as least privilege)
+
+On the GCP project (if using job creation across resources)
+
+roles/iam.serviceAccountUser if using impersonation of another SA
+
+roles/storage.admin is not required for just reading.
+
+Example IAM bindings (conceptual):
+
+Grant airflow-sa@PROJECT.iam.gserviceaccount.com -> roles/storage.objectViewer on bucket.
+
+Grant airflow-sa@PROJECT.iam.gserviceaccount.com -> roles/bigquery.dataEditor on dataset.
+
+Grant airflow-sa@PROJECT.iam.gserviceaccount.com -> roles/bigquery.jobUser on project.
+
+4) Airflow credentials / connection setup
+
+Options to allow Airflow to authenticate:
+
+Configure google_cloud_default connection in Airflow Connections:
+
+set Keyfile JSON (service account key) in the connection extras or use Google Cloud connection type and upload the JSON key.
+
+set Project ID field to your PROJECT_ID.
+
+Environment variable on Airflow worker:
+
+Export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json and make sure worker can access it.
+
+Cloud Composer / Workload Identity (recommended on GCP):
+
+Configure Composer environment to impersonate a GCP service account. Then pass impersonation_chain or rely on platform identity — no JSON key required.
+
+If you plan to impersonate, GCSToBigQueryOperator accepts impersonation_chain=[service_account_email].
+
+5) Ingesting multiple CSV files in a folder
+
+A few options (choose based on need):
+
+If filenames predictable: pass multiple source_objects to GCSToBigQueryOperator:
+
+source_objects = ["incoming/finance/day1.csv", "incoming/finance/day2.csv"]
+
+
+If you want to load every CSV under prefix:
+
+Use a short sensor GCSPrefixSensor or GCSObjectsWithPrefixExistenceSensor to wait for files under a prefix.
+
+Use GCSListObjectsOperator to list objects under the prefix, and then create a dynamic set of load tasks (one GCSToBigQueryOperator per file) — or implement a single BigQuery load job that accepts multiple GCS URIs.
+
+Or stage all files as a single load by passing all object names in source_objects=[...] (the operator will load them into a single table in one job).
+
+Alternative: Create an external table in BigQuery that points to gs://bucket/prefix/*.csv and then INSERT into a managed table — useful for many files.
+
+6) Schema considerations & data quality
+
+If schema is stable, provide schema_fields in the operator to ensure consistent types.
+
+If using autodetect=True, BigQuery will infer types but may be inconsistent across files — better for quick testing.
+
+If you need strict validation, use a pre-load Python task to validate CSV columns / types before invoking the load.
+
+7) Logging, errors & retries
+
+The GCSToBigQueryOperator surfaces BigQuery job errors in Airflow logs; configure retries and retry_delay in default_args.
+
+Use write_disposition="WRITE_APPEND" to avoid accidental overwrites in production unless you intend to replace (WRITE_TRUNCATE).
+
+8) Example schema_fields (if you want to supply explicit schema)
+schema_fields = [
+    {"name": "txn_id", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "amount", "type": "FLOAT", "mode": "NULLABLE"},
+    {"name": "txn_time", "type": "TIMESTAMP", "mode": "NULLABLE"},
+    {"name": "customer_id", "type": "STRING", "mode": "NULLABLE"},
+]
+
+
+Then pass schema_fields=schema_fields (and autodetect=False) to the operator.
+
+9) Quick checklist before running
+
+ Create BigQuery dataset staging_dataset (or allow operator to create table if permitted).
+
+ Upload CSV to gs://my-data-bucket/incoming/finance/daily_transactions_2025-11-30.csv.
+
+ Create service account airflow-sa@PROJECT and give it the IAM roles listed above.
+
+ Configure google_cloud_default Airflow connection or set GOOGLE_APPLICATION_CREDENTIALS on workers.
+
+ Drop the DAG into airflow dags/ folder and trigger it.
+
+If you'd like, I can:
+
+produce a dynamic DAG that lists all CSVs in a prefix and creates a per-file BQ load task (I can give the exact code for dynamic task generation / mapping), or
+
+adapt the DAG for Cloud Composer best practices (workload identity / impersonation), or
+
+create a DAG that validates schema (small Python validation task) before loading.
+
+Which of those (dynamic mapping / Composer impersonation / validation) do you want me to include next?
+
+You said:
+Create a separate DAG to read data from a BigQuery table and convert to xml and store in specified GCS storage bucket. Consider putting the xml file directly in GCS without storing it in local folder
+ChatGPT said:
+Thought for 9s
+
+Nice — below is a ready-to-drop-in Airflow DAG (Airflow 2 + Google provider) that:
+
+reads rows from a BigQuery table,
+
+converts them to an XML document in memory (no local disk),
+
+uploads the XML bytes directly to a specified GCS bucket/path.
+
+I also include required IAM roles/permissions, how to configure the Airflow connection/credentials, and a few useful options.
+
+DAG: BigQuery -> XML -> GCS (no local file)
+# bq_to_xml_gcs_dag.py
+from datetime import datetime, timedelta
+import io
+from xml.etree import ElementTree as ET
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+
+# === USER - change these values for your environment ===
+PROJECT_ID = "my-gcp-project-123"
+BQ_DATASET = "my_dataset"
+BQ_TABLE = "my_table"
+BQ_TABLE_FQN = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"  # fully-qualified table
+GCS_BUCKET = "my-output-bucket"
+GCS_FOLDER = "exports/xml"   # folder/prefix inside bucket
+OUTPUT_FILENAME_TPL = "my_table_export_{{ ds_nodash }}.xml"  # airflow templated filename
+GOOGLE_CONN_ID = "google_cloud_default"  # Airflow Connection for GCP
+SQL_QUERY = f"SELECT * FROM `{BQ_TABLE_FQN}` LIMIT 1000"  # adjust as needed
+
+# DAG args
+default_args = {
+    "owner": "data-engineer",
+    "depends_on_past": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+def bq_table_to_xml_upload(
+    *,
+    project_id: str,
+    sql: str,
+    gcs_bucket: str,
+    gcs_object_path: str,
+    google_conn_id: str = "google_cloud_default",
+    **context
+) -> None:
+    """
+    Query BigQuery, build XML in-memory, and upload to GCS directly (no local file).
+    - Uses BigQueryHook.get_pandas_df to retrieve rows (requires pandas).
+    - Uses GCSHook.upload to send bytes to GCS.
+    """
+
+    # 1) Fetch rows from BigQuery into a pandas DataFrame
+    bq_hook = BigQueryHook(gcp_conn_id=google_conn_id, use_legacy_sql=False)
+    # get_pandas_df will return a pandas.DataFrame (must have pandas available in env)
+    df = bq_hook.get_pandas_df(sql=sql, project_id=project_id)
+
+    # 2) Convert DataFrame rows to XML using xml.etree.ElementTree
+    # Root element
+    root = ET.Element("Rows")
+
+    # If df is empty, create an empty placeholder node (optional)
+    if df.empty:
+        ET.SubElement(root, "Row")  # empty row marker (optional)
+
+    for rec in df.to_dict(orient="records"):
+        row_el = ET.SubElement(root, "Row")
+        # Add each column as child element under Row
+        for col_name, value in rec.items():
+            # XML element names must be valid tags — replace spaces with underscore
+            safe_tag = str(col_name).replace(" ", "_")
+            child = ET.SubElement(row_el, safe_tag)
+            # convert None to empty string, datetimes and floats to strings
+            child.text = "" if value is None else str(value)
+
+    # Create bytes representation of XML (pretty printing not required)
+    xml_bytes = ET.tostring(root, encoding="utf-8", method="xml")
+    # Optionally, if you want a declaration header:
+    xml_declaration = b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    xml_payload = xml_declaration + xml_bytes
+
+    # 3) Upload directly to GCS using GCSHook (no local file)
+    gcs = GCSHook(gcp_conn_id=google_conn_id)
+    # gcs.upload signature can accept data (in many provider versions).
+    # If your Airflow provider version requires a filename, you can write to BytesIO and
+    # use upload() with filename-like object. Below: upload from bytes if supported.
+    # Object path (full path inside bucket)
+    gcs_object = gcs_object_path
+
+    # Try to use the data parameter if available (most recent providers)
+    try:
+        gcs.upload(bucket_name=gcs_bucket, object_name=gcs_object, data=xml_payload, mime_type="application/xml")
+    except TypeError:
+        # Fallback: create an in-memory bytes buffer and use upload with filename param (older providers)
+        buf = io.BytesIO(xml_payload)
+        # Some GCSHook implementations accept 'file_obj' or expect 'filename' path.
+        # We'll use the underlying google client if necessary:
+        client = gcs.get_conn()  # returns google.cloud.storage.Client
+        bucket = client.bucket(gcs_bucket)
+        blob = bucket.blob(gcs_object)
+        blob.upload_from_string(xml_payload, content_type="application/xml")
+
+    # Optionally push the GCS path to XCom for downstream tasks
+    ti = context["ti"]
+    gcs_uri = f"gs://{gcs_bucket}/{gcs_object}"
+    ti.xcom_push(key="gcs_xml_uri", value=gcs_uri)
+    return gcs_uri
+
+
+with DAG(
+    dag_id="bigquery_to_xml_gcs",
+    default_args=default_args,
+    description="Read BigQuery table, convert to XML and upload directly to GCS (no local file)",
+    schedule_interval=None,  # set as needed, e.g., "0 1 * * *"
+    start_date=datetime(2025, 1, 1),
+    catchup=False,
+    tags=["bigquery", "gcs", "xml"],
+) as dag:
+
+    export_bq_to_xml = PythonOperator(
+        task_id="export_bq_table_to_xml_and_upload_to_gcs",
+        python_callable=bq_table_to_xml_upload,
+        op_kwargs={
+            "project_id": PROJECT_ID,
+            "sql": SQL_QUERY,
+            "gcs_bucket": GCS_BUCKET,
+            # object name is folder + templated filename (Airflow template available)
+            "gcs_object_path": f"{GCS_FOLDER}/{OUTPUT_FILENAME_TPL}",
+            "google_conn_id": GOOGLE_CONN_ID,
+        },
+        provide_context=True,
+    )
+
+    export_bq_to_xml
+
+Notes / explanation
+
+The DAG uses BigQueryHook.get_pandas_df(...) to get the query result as a pandas DataFrame. This requires pandas to be available on your Airflow workers. If you cannot install pandas, you can instead use bq_hook.get_records(sql) and iterate rows (the implementation above prefers pandas for ease of use).
+
+The XML is built entirely in memory with xml.etree.ElementTree and uploaded to GCS directly using the GCSHook or the google.cloud.storage client as a fallback. No local filesystem is used.
+
+OUTPUT_FILENAME_TPL uses Airflow templating (e.g., {{ ds_nodash }}) to create a date-based filename. You can change it to my_export_{{ ts_nodash }}.xml or a fixed name.
+
+The DAG pushes the GCS URI into XCom key gcs_xml_uri so downstream tasks (if any) can read it.
+
+Required Airflow / Python libraries
+
+apache-airflow-providers-google (ensure version compatible with your Airflow).
+
+google-cloud-bigquery and google-cloud-storage (usually installed by the Google provider package).
+
+pandas if you rely on get_pandas_df.
+
+Permissions / IAM roles the Service Account needs
+
+The service account Airflow uses (via google_cloud_default connection or GOOGLE_APPLICATION_CREDENTIALS) must have least privilege roles:
+
+On BigQuery (project or dataset):
+
+roles/bigquery.dataViewer — to read table data
+
+roles/bigquery.jobUser — to run query jobs (if you're running queries)
+
+On GCS (bucket or project):
+
+roles/storage.objectCreator — to write new objects into the target bucket
+
+alternatively roles/storage.objectAdmin if you need delete/overwrite/delete+list
+
+roles/storage.objectViewer / roles/storage.objectLister only if you need read/list (not required for upload alone)
+
+Example binding summary
+
+Grant airflow-sa@PROJECT.iam.gserviceaccount.com:
+
+roles/bigquery.dataViewer on the dataset (or project)
+
+roles/bigquery.jobUser on the project
+
+roles/storage.objectCreator on the target GCS bucket
+
+If you run Airflow on Cloud Composer or GKE with Workload Identity, prefer Workload Identity / impersonation rather than uploading a JSON key. If using impersonation, ensure the Composer VM service account has roles/iam.serviceAccountUser on the target service account.
+
+Airflow connection / credentials
+
+In local Airflow, set google_cloud_default Airflow Connection and either:
+
+provide a JSON key (Keyfile JSON) in the connection extras, or
+
+set GOOGLE_APPLICATION_CREDENTIALS on worker/worker env pointing to a mounted key file.
+
+In Cloud Composer: use Workload Identity or set impersonation_chain on hooks/operators.
+
+Edge cases & extras you might want
+
+Large resultsets: reading very large tables into memory may lead to memory pressure. If so:
+
+export table to GCS (Avro/CSV) using BigQueryToGCSOperator and then stream/convert each file to XML in a streaming fashion, or
+
+page results with the BigQuery client and stream XML elements to a GCS blob (using google.cloud.storage.Blob.open() in write-binary streaming mode).
+
+XML element name sanitization: the sample replaces spaces with underscores for column names. If your column names contain characters invalid in XML tags, sanitize them (or use attributes instead).
+
+Pretty printing: ElementTree in this example produces compact XML. If you want pretty/indented XML, run a small reformat step (but that is optional and increases CPU).
+
+Encoding / types: you may need to format dates/timestamps explicitly (the code just calls str() on values).
+
+If you want, I can:
+
+convert this to a streaming version that is safe for very large tables (streams rows and writes the GCS blob incrementally),
+
+show a variant that uses BigQueryToGCSOperator followed by a lightweight converter that streams the exported CSV/Avro -> XML without memory spikes,
+
+or adapt the DAG for Cloud Composer with Workload Identity and impersonation_chain.
+
+Which variant would you like next?
+
+You said:
+Now combine both the DAGs together . Remove wait for csv dependency.
+ChatGPT said:
+
+Good — below is a single combined Airflow DAG that:
+
+Loads a specified CSV from a specific GCS folder into a BigQuery table (no sensor / no wait),
+
+Then immediately reads that BigQuery table, converts rows into an XML file in-memory, and uploads the XML directly to a specified GCS path,
+
+Passes the created GCS XML URI via XCom so you can use it downstream.
+
+I removed the GCS sensor as you asked. The two tasks are sequenced: gcs_to_bq_load → bq_to_xml_upload. Drop this file into your dags/ folder and update the top constants to your environment.
+
+# combined_gcs_to_bq_then_bq_to_xml_dag.py
+from datetime import datetime, timedelta
+import io
+from xml.etree import ElementTree as ET
+
+from airflow import DAG
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+
+# === USER CONFIG - change these values ===
+PROJECT_ID = "my-gcp-project-123"
+GCS_INPUT_BUCKET = "my-data-bucket"
+GCS_INPUT_FOLDER = "incoming/finance"
+CSV_FILENAME = "daily_transactions_2025-11-30.csv"      # file to load
+GCS_INPUT_OBJECT = f"{GCS_INPUT_FOLDER}/{CSV_FILENAME}"
+
+BQ_DATASET = "staging_dataset"
+BQ_TABLE = "transactions_staging"
+DEST_TABLE = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"   # fully-qualified BQ table
+
+# Output (XML) config
+GCS_OUTPUT_BUCKET = "my-output-bucket"
+GCS_OUTPUT_FOLDER = "exports/xml"
+OUTPUT_FILENAME_TPL = "transactions_export_{{ ds_nodash }}.xml"  # templated
+
+# Airflow connection and optional impersonation
+GOOGLE_CONN_ID = "google_cloud_default"
+# If you want to impersonate a service account, set as list e.g.
+# IMPERSONATION_CHAIN = ["airflow-sa@my-gcp-project-123.iam.gserviceaccount.com"]
+IMPERSONATION_CHAIN = None
+
+# SQL to read back from BigQuery (you can template if needed)
+SQL_READ_FROM_BQ = f"SELECT * FROM `{DEST_TABLE}`"
+
+# DAG args
+default_args = {
+    "owner": "data-engineer",
+    "depends_on_past": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+def bq_table_to_xml_upload(
+    *,
+    project_id: str,
+    sql: str,
+    gcs_bucket: str,
+    gcs_object_path: str,
+    google_conn_id: str = "google_cloud_default",
+    impersonation_chain=None,
+    **context
+) -> str:
+    """
+    Query BigQuery, build XML in-memory, and upload to GCS directly (no local file).
+    Returns GCS URI and pushes it to XCom.
+    """
+    # 1) Query BigQuery into pandas DataFrame
+    bq_hook = BigQueryHook(gcp_conn_id=google_conn_id, use_legacy_sql=False)
+    # Support impersonation if provided by using the hook's client_args (some versions).
+    # For simplicity, we let the environment/connection handle impersonation (airflow provider supports impersonation_chain param in some hooks/operators).
+    df = bq_hook.get_pandas_df(sql=sql, project_id=project_id, dialect="standard")
+
+    # 2) Build XML in-memory
+    root = ET.Element("Rows")
+    if df.empty:
+        # Create an explicit empty marker (optional)
+        ET.SubElement(root, "Row")
+    else:
+        for rec in df.to_dict(orient="records"):
+            row_el = ET.SubElement(root, "Row")
+            for col_name, value in rec.items():
+                safe_tag = str(col_name).replace(" ", "_")
+                child = ET.SubElement(row_el, safe_tag)
+                child.text = "" if value is None else str(value)
+
+    xml_bytes = ET.tostring(root, encoding="utf-8", method="xml")
+    xml_declaration = b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    xml_payload = xml_declaration + xml_bytes
+
+    # 3) Upload to GCS (no local file)
+    gcs = GCSHook(gcp_conn_id=google_conn_id)
+    object_name = gcs_object_path
+
+    # Try modern hook upload (data param), fallback to google client
+    try:
+        gcs.upload(bucket_name=gcs_bucket, object_name=object_name, data=xml_payload, mime_type="application/xml")
+    except TypeError:
+        # Fallback: use underlying google.cloud.storage client
+        client = gcs.get_conn()
+        bucket = client.bucket(gcs_bucket)
+        blob = bucket.blob(object_name)
+        blob.upload_from_string(xml_payload, content_type="application/xml")
+
+    gcs_uri = f"gs://{gcs_bucket}/{object_name}"
+    # push to XCom
+    ti = context["ti"]
+    ti.xcom_push(key="gcs_xml_uri", value=gcs_uri)
+    return gcs_uri
+
+
+with DAG(
+    dag_id="combined_gcs_csv_to_bq_then_bq_to_xml",
+    default_args=default_args,
+    description="Load CSV from GCS into BigQuery then convert BQ rows to XML and upload to GCS (no local file, no sensor).",
+    schedule_interval=None,  # set schedule as required
+    start_date=datetime(2025, 1, 1),
+    catchup=False,
+    tags=["gcs", "bigquery", "xml", "etl"],
+) as dag:
+
+    # Task 1: load CSV from GCS to BigQuery
+    gcs_to_bq_load = GCSToBigQueryOperator(
+        task_id="gcs_to_bigquery_load",
+        bucket=GCS_INPUT_BUCKET,
+        source_objects=[GCS_INPUT_OBJECT],
+        destination_project_dataset_table=DEST_TABLE,
+        source_format="CSV",
+        skip_leading_rows=1,
+        write_disposition="WRITE_TRUNCATE",      # change to WRITE_APPEND if you want to append
+        create_disposition="CREATE_IF_NEEDED",
+        autodetect=True,
+        google_cloud_conn_id=GOOGLE_CONN_ID,
+        impersonation_chain=IMPERSONATION_CHAIN,
+    )
+
+    # Task 2: read BQ table -> XML -> upload to GCS
+    bq_to_xml = PythonOperator(
+        task_id="bq_table_to_xml_and_upload_to_gcs",
+        python_callable=bq_table_to_xml_upload,
+        op_kwargs={
+            "project_id": PROJECT_ID,
+            "sql": SQL_READ_FROM_BQ,
+            "gcs_bucket": GCS_OUTPUT_BUCKET,
+            "gcs_object_path": f"{GCS_OUTPUT_FOLDER}/{OUTPUT_FILENAME_TPL}",
+            "google_conn_id": GOOGLE_CONN_ID,
+            "impersonation_chain": IMPERSONATION_CHAIN,
+        },
+        provide_context=True,
+    )
+
+    # Sequence: load -> export
+    gcs_to_bq_load >> bq_to_xml
+
+What I changed / highlights
+
+Combined both workflows into one DAG with two tasks.
+
+Removed the GCSObjectExistenceSensor (no wait for the CSV).
+
+GCSToBigQueryOperator directly loads the specified CSV (source_objects list) into BigQuery.
+
+The PythonOperator queries the BigQuery table and uploads the XML bytes to GCS (no local disk).
+
+The XML GCS URI is pushed to XCom under key gcs_xml_uri.
+
+Required IAM roles / service account (minimum recommended)
+
+Assign these to the service account used by Airflow (the one referenced by google_cloud_default or via Workload Identity / impersonation):
+
+On GCS input bucket (or project):
+
+roles/storage.objectViewer — read the CSV from the input bucket.
+
+On BigQuery (dataset/project):
+
+roles/bigquery.dataEditor or roles/bigquery.dataOwner on the dataset (if you want the operator to create/replace table), OR:
+
+roles/bigquery.dataWriter (if only writing) plus
+
+roles/bigquery.jobUser on the project to run load jobs.
+
+If you use WRITE_TRUNCATE or CREATE_IF_NEEDED, ensure the SA can create/replace tables (dataEditor/dataOwner).
+
+On GCS output bucket:
+
+roles/storage.objectCreator (or roles/storage.objectAdmin if you need overwrite/delete) — to upload the XML file.
+
+For impersonation (Cloud Composer / Workload Identity):
+
+Grant roles/iam.serviceAccountUser to the Composer/GKE service account on the target SA you'll impersonate.
+
+Airflow connection / credentials
+
+Locally: set google_cloud_default connection with Keyfile JSON or set GOOGLE_APPLICATION_CREDENTIALS on workers.
+
+Cloud Composer: prefer Workload Identity or use impersonation_chain (set IMPERSONATION_CHAIN above) instead of keyfiles.
+
+Notes & caveats
+
+autodetect=True is used for quick schema inference. For production, provide schema_fields to ensure deterministic types.
+
+write_disposition="WRITE_TRUNCATE" will replace the destination table on every run — change to WRITE_APPEND if you want to append.
+
+The Python task uses get_pandas_df which loads data into memory. For very large tables, this can cause memory pressure:
+
+Option A: export BQ to GCS (Avro/CSV) and stream-convert the exported files to XML in chunks.
+
+Option B: use the BigQuery client to page through results and stream writes to GCS (using Blob.open("wb")) to avoid reading all rows into memory.
+
+Sanitization: column names are naively sanitized by replacing spaces with underscores. If your column names contain other invalid XML characters, sanitize further.
+
+Templating: OUTPUT_FILENAME_TPL is an Airflow template and will render {{ ds_nodash }} at runtime.
+
+If you want, I can:
+
+change WRITE_TRUNCATE to WRITE_APPEND and add a dedupe step,
+
+change the XML generation to stream-mode (safe for very large tables),
+
+or add a third task to notify success (Slack/Email) and include the gcs_xml_uri from XCom in that message — tell me which and I'll add it.
+
+You said:
+Make xml generation to stream mode
+ChatGPT said:
+
+Nice — I converted the XML generation to streaming mode so the Python task never loads the full BigQuery resultset into memory. Instead it:
+
+runs the query and pages through results,
+
+streams XML bytes directly into a GCS blob using the google-cloud-storage streaming writer,
+
+writes an XML prolog, writes each <Row>...</Row> as rows arrive, then closes with the root end tag.
+
+Drop this DAG into your dags/ folder and update the constants at top to match your environment.
+
+# combined_gcs_to_bq_then_bq_to_xml_streaming.py
+from datetime import datetime, timedelta
+import io
+import typing
+from xml.sax.saxutils import escape as xml_escape
+
+from airflow import DAG
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+
+# === USER CONFIG - change these values ===
+PROJECT_ID = "my-gcp-project-123"
+GCS_INPUT_BUCKET = "my-data-bucket"
+GCS_INPUT_FOLDER = "incoming/finance"
+CSV_FILENAME = "daily_transactions_2025-11-30.csv"
+GCS_INPUT_OBJECT = f"{GCS_INPUT_FOLDER}/{CSV_FILENAME}"
+
+BQ_DATASET = "staging_dataset"
+BQ_TABLE = "transactions_staging"
+DEST_TABLE = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+
+# Output (XML) config
+GCS_OUTPUT_BUCKET = "my-output-bucket"
+GCS_OUTPUT_FOLDER = "exports/xml"
+OUTPUT_FILENAME_TPL = "transactions_export_{{ ds_nodash }}.xml"
+
+# Airflow connection and optional impersonation
+GOOGLE_CONN_ID = "google_cloud_default"
+IMPERSONATION_CHAIN = None  # or ["sa@project.iam.gserviceaccount.com"]
+
+# SQL to read back from BigQuery
+SQL_READ_FROM_BQ = f"SELECT * FROM `{DEST_TABLE}`"
+
+# Controls for streaming
+BQ_PAGE_SIZE = 10_000  # rows per page fetched from BigQuery; tune based on memory and throughput
+WRITE_BUFFER_SIZE = 1024 * 256  # buffer used by GCS blob writer internally (not strictly required)
+
+# DAG args
+default_args = {
+    "owner": "data-engineer",
+    "depends_on_past": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+
+def stream_bq_to_gcs_xml(
+    *,
+    project_id: str,
+    sql: str,
+    gcs_bucket: str,
+    gcs_object_path: str,
+    google_conn_id: str = "google_cloud_default",
+    impersonation_chain: typing.Optional[list] = None,
+    page_size: int = BQ_PAGE_SIZE,
+    **context,
+) -> str:
+    """
+    Stream rows from BigQuery query results and write XML directly to a GCS object (no local file,
+    no full-result in memory).
+
+    Approach:
+      - Use BigQuery client to execute the query and iterate over RowPaged results with pages.
+      - Use google-cloud-storage Blob.open("wb") (binary write) to get a writable stream to GCS.
+      - Write XML prolog, root start tag, then for each row write a <Row> ... </Row> chunk.
+    Returns the GCS URI (gs://bucket/object) and pushes it to XCom.
+    """
+
+    # 1) Get BigQuery client via BigQueryHook (uses Airflow connection / credentials)
+    bq_hook = BigQueryHook(gcp_conn_id=google_conn_id, use_legacy_sql=False)
+    bq_client = bq_hook.get_client(project_id=project_id)  # returns google.cloud.bigquery.Client
+
+    # 2) Start the query job
+    # use job_config defaults; we rely on standard SQL
+    query_job = bq_client.query(sql, project=project_id)
+    # wait for the job to start and get a RowIterator
+    row_iter = query_job.result(page_size=page_size)  # RowIterator, supports .pages
+
+    # 3) Get GCS client & open blob in write-binary streaming mode
+    gcs_hook = GCSHook(gcp_conn_id=google_conn_id)
+    storage_client = gcs_hook.get_conn()  # google.cloud.storage.Client
+    bucket = storage_client.bucket(gcs_bucket)
+    blob = bucket.blob(gcs_object_path)
+
+    # Use blob.open to stream directly to GCS (this creates a resumable upload in chunks)
+    # Note: blob.open exists in google-cloud-storage >= 1.20.0; fallback to upload_from_string if not available.
+    try:
+        # 'wb' gives a file-like binary stream. Default chunk size uses blob.chunk_size if set.
+        # Optionally set blob.chunk_size for performance (in bytes); 256KB.. range is typical.
+        blob.chunk_size = WRITE_BUFFER_SIZE
+        with blob.open("wb") as gcs_file:  # file-like object
+            # Write XML declaration and root open tag
+            gcs_file.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
+            gcs_file.write(b"<Rows>\n")
+
+            # 4) Iterate over pages, then rows — stream each row as XML
+            # We use row.items() to get (column, value) pairs in the row; BigQuery Row behaves like a mapping.
+            any_row_written = False
+            for page in row_iter.pages:
+                for row in page:
+                    any_row_written = True
+                    # row can be a google.cloud.bigquery.table.Row
+                    # Build XML for the row incrementally. Escape cell values for XML safety.
+                    # We'll produce something like:
+                    #   <Row><col1>value</col1><col2>value</col2>...</Row>\n
+                    # Convert keys to safe tags: replace spaces with underscores.
+                    parts = ["  <Row>"]
+                    # BigQuery Row preserves order of schema; iterate over row.items()
+                    # But Row.items() returns (key, value) pairs.
+                    for col_name, value in row.items():
+                        safe_tag = str(col_name).replace(" ", "_")
+                        # Convert value to string and escape XML-special chars
+                        if value is None:
+                            text = ""
+                        else:
+                            # For datetime, date, decimal etc. str() is okay; format if you need special formatting
+                            text = str(value)
+                        escaped = xml_escape(text)
+                        parts.append(f"<{safe_tag}>{escaped}</{safe_tag}>")
+                    parts.append("</Row>\n")
+                    row_xml = "".join(parts)
+                    # Write bytes to GCS file (UTF-8)
+                    gcs_file.write(row_xml.encode("utf-8"))
+
+            # If there were zero rows, optionally write an empty Row marker or leave empty root.
+            if not any_row_written:
+                gcs_file.write(b"  <Row />\n")
+
+            # Write closing root tag
+            gcs_file.write(b"</Rows>\n")
+
+    except AttributeError:
+        # Fallback for google-cloud-storage versions without blob.open:
+        # Build bytes in small chunks and call upload_from_string at the end.
+        # This fallback will collect bytes in memory — only acceptable for small datasets.
+        # We try to avoid this path; prefer environments with modern google-cloud-storage.
+        buffer = io.BytesIO()
+        buffer.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
+        buffer.write(b"<Rows>\n")
+        any_row_written = False
+        for page in row_iter.pages:
+            for row in page:
+                any_row_written = True
+                parts = ["  <Row>"]
+                for col_name, value in row.items():
+                    safe_tag = str(col_name).replace(" ", "_")
+                    text = "" if value is None else str(value)
+                    escaped = xml_escape(text)
+                    parts.append(f"<{safe_tag}>{escaped}</{safe_tag}>")
+                parts.append("</Row>\n")
+                buffer.write("".join(parts).encode("utf-8"))
+        if not any_row_written:
+            buffer.write(b"  <Row />\n")
+        buffer.write(b"</Rows>\n")
+        blob.upload_from_string(buffer.getvalue(), content_type="application/xml")
+
+    # Compose and push XCom value
+    gcs_uri = f"gs://{gcs_bucket}/{gcs_object_path}"
+    ti = context["ti"]
+    ti.xcom_push(key="gcs_xml_uri", value=gcs_uri)
+    return gcs_uri
+
+
+with DAG(
+    dag_id="combined_gcs_csv_to_bq_then_bq_to_xml_streaming",
+    default_args=default_args,
+    description="Load CSV from GCS into BigQuery then stream BQ rows to XML and upload to GCS (no local file).",
+    schedule_interval=None,
+    start_date=datetime(2025, 1, 1),
+    catchup=False,
+    tags=["gcs", "bigquery", "xml", "etl"],
+) as dag:
+
+    # Task 1: load CSV from GCS to BigQuery
+    gcs_to_bq_load = GCSToBigQueryOperator(
+        task_id="gcs_to_bigquery_load",
+        bucket=GCS_INPUT_BUCKET,
+        source_objects=[GCS_INPUT_OBJECT],
+        destination_project_dataset_table=DEST_TABLE,
+        source_format="CSV",
+        skip_leading_rows=1,
+        write_disposition="WRITE_TRUNCATE",      # change to WRITE_APPEND if desired
+        create_disposition="CREATE_IF_NEEDED",
+        autodetect=True,
+        google_cloud_conn_id=GOOGLE_CONN_ID,
+        impersonation_chain=IMPERSONATION_CHAIN,
+    )
+
+    # Task 2: read BQ table -> stream XML -> upload to GCS
+    bq_to_xml_streaming = PythonOperator(
+        task_id="bq_table_to_xml_stream_and_upload_to_gcs",
+        python_callable=stream_bq_to_gcs_xml,
+        op_kwargs={
+            "project_id": PROJECT_ID,
+            "sql": SQL_READ_FROM_BQ,
+            "gcs_bucket": GCS_OUTPUT_BUCKET,
+            "gcs_object_path": f"{GCS_OUTPUT_FOLDER}/{OUTPUT_FILENAME_TPL}",
+            "google_conn_id": GOOGLE_CONN_ID,
+            "impersonation_chain": IMPERSONATION_CHAIN,
+            "page_size": BQ_PAGE_SIZE,
+        },
+        provide_context=True,
+    )
+
+    gcs_to_bq_load >> bq_to_xml_streaming
+
+Important notes, tips & caveats
+
+Streaming avoids full-result memory usage
+The DAG pages results from BigQuery and streams each <Row>...</Row> directly to the GCS blob. This makes it safe for large tables.
+
+GCS streaming support
+The blob.open("wb") method used here requires a recent google-cloud-storage. If that method isn't available in your environment the fallback will collect everything in memory then upload, which defeats streaming. If you see that fallback warning, upgrade google-cloud-storage to a version that supports blob.open (or implement a resumable upload with the raw client).
+
+XML escaping & tags
+Values are XML-escaped via xml.sax.saxutils.escape. Column names are naively sanitized by replacing spaces with underscores. If your column names contain characters invalid for XML tag names (e.g., starting with digits, containing punctuation), either sanitize more aggressively or write columns as <Col name="...">value</Col>.
+
+Schema / datetime formatting
+The code uses str(value) for most types. If you need specific timestamp/date formatting, detect datetime/date and format accordingly.
+
+Permissions required
+Same as before, the Airflow service account must have:
+
+GCS input: roles/storage.objectViewer
+
+BigQuery: roles/bigquery.dataEditor / roles/bigquery.jobUser (or appropriate dataset-level roles)
+
+GCS output: roles/storage.objectCreator (or roles/storage.objectAdmin to overwrite/delete)
+
+Job sizing & performance
+Tune BQ_PAGE_SIZE and blob.chunk_size (WRITE_BUFFER_SIZE) based on throughput and memory characteristics. Use larger chunk sizes for fewer network calls but ensure workers have enough buffer memory.
+
+Retries & idempotency
+If the PythonOperator retries, be careful about partial uploads. GCS resumable uploads may leave incomplete blobs if a retry occurs mid-upload. Consider:
+
+writing to a temp object (e.g., /tmp/<runid>.inprogress.xml) and renaming/ copying to the final object after successful completion (atomic rename isn't available in GCS, but copying and deleting the temp file works),
+
+or set max_retries=0 for the PythonOperator and handle retries at DAG level via an idempotency pattern.
+
+Workload Identity / Impersonation
+On Composer/GKE, prefer Workload Identity instead of JSON keys. If using impersonation, ensure the Airflow service account has roles/iam.serviceAccountUser on the target SA.
+
+If you want, I can:
+
+add the safe-temp-object -> finalize rename/copy step to make uploads idempotent for retries,
+
+format timestamps in ISO-8601 inside the XML,
+
+adapt the XML element naming to use <Col name="...">value</Col> to avoid tag-name restrictions,
+
+or produce a version that first exports BQ to Avro in GCS and then streams Avro -> XML (useful for very complex types).
+
+Which of those enhancements would you like next?
+
+You said:
+add the safe-temp-object -> finalize rename/copy step to make uploads idempotent for retries,
+
+format timestamps in ISO-8601 inside the XML,
+
+adapt the XML element naming to use <Col name="...">value</Col> to avoid tag-name restrictions,
+
+or produce a version that first exports BQ to Avro in GCS and then streams Avro -> XML (useful for very complex types).
+ChatGPT said:
+Thought for 10s
+
+Great — I implemented everything you asked for in one updated, production-ready DAG:
+
+Streaming XML generation (no full-table in memory),
+
+Safe temp object → finalize (copy + delete) to make uploads idempotent across retries,
+
+Timestamp formatting in ISO-8601 (YYYY-MM-DDTHH:MM:SS[.fff][+ZZ:ZZ]) for datetime/date objects,
+
+XML element naming using <Col name="...">value</Col> to avoid XML tag-name limitations,
+
+Uses unique per-run temp object names (includes run_id and try number) so retries don't corrupt previous uploads,
+
+Handles fallback if blob.open("wb") is not available (but fallback will collect bytes — see notes),
+
+Pushes the final gs://... URI to XCom.
+
+Drop this file into your dags/ folder and update the top-level constants (project, buckets, table, etc.) to match your environment.
+
+# combined_gcs_to_bq_then_bq_to_xml_streaming_safe.py
+from datetime import datetime, date, timedelta
+import io
+import typing
+from xml.sax.saxutils import escape as xml_escape
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+
+# === USER CONFIG - change these values ===
+PROJECT_ID = "my-gcp-project-123"
+GCS_INPUT_BUCKET = "my-data-bucket"
+GCS_INPUT_FOLDER = "incoming/finance"
+CSV_FILENAME = "daily_transactions_2025-11-30.csv"
+GCS_INPUT_OBJECT = f"{GCS_INPUT_FOLDER}/{CSV_FILENAME}"
+
+BQ_DATASET = "staging_dataset"
+BQ_TABLE = "transactions_staging"
+DEST_TABLE = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+
+# Output (XML) config
+GCS_OUTPUT_BUCKET = "my-output-bucket"
+GCS_OUTPUT_FOLDER = "exports/xml"
+OUTPUT_FILENAME_TPL = "transactions_export_{{ ds_nodash }}.xml"  # final object name (templated)
+
+# Airflow connection and optional impersonation
+GOOGLE_CONN_ID = "google_cloud_default"
+IMPERSONATION_CHAIN = None  # or ["sa@project.iam.gserviceaccount.com"]
+
+# SQL to read back from BigQuery
+SQL_READ_FROM_BQ = f"SELECT * FROM `{DEST_TABLE}`"
+
+# Controls for streaming
+BQ_PAGE_SIZE = 10_000  # rows per page; tune according to memory/throughput
+WRITE_BUFFER_SIZE = 1024 * 256  # chunk size for resumable upload (bytes). Tune as required.
+
+# DAG args
+default_args = {
+    "owner": "data-engineer",
+    "depends_on_past": False,
+    "retries": 2,
+    "retry_delay": timedelta(minutes=5),
+}
+
+
+def _format_value_iso(v):
+    """Format values for XML text. Dates/datetimes in ISO-8601; else string. None -> empty."""
+    if v is None:
+        return ""
+    if isinstance(v, datetime):
+        # keep timezone if present, else treat as naive
+        return v.isoformat()
+    if isinstance(v, date) and not isinstance(v, datetime):
+        return v.isoformat()
+    # For Decimal / float / bool / int / others, str() is usually fine
+    return str(v)
+
+
+def stream_bq_to_gcs_xml_safe(
+    *,
+    project_id: str,
+    sql: str,
+    gcs_bucket: str,
+    gcs_object_path: str,
+    google_conn_id: str = "google_cloud_default",
+    impersonation_chain: typing.Optional[list] = None,
+    page_size: int = BQ_PAGE_SIZE,
+    **context,
+) -> str:
+    """
+    Stream rows from BigQuery query results and write XML directly to a temporary GCS object,
+    then copy the temp object to the final object name (overwrite if exists) and delete temp.
+    Ensures idempotency during retries by writing to a unique temp object per try.
+    Returns the final GCS URI and pushes it to XCom.
+    """
+
+    ti = context["ti"]
+    run_id = context.get("run_id", "manual__" + datetime.utcnow().isoformat())
+    try_number = ti.try_number if hasattr(ti, "try_number") else 1
+
+    # Create a unique temp object name for this run + try
+    final_object = gcs_object_path  # e.g., exports/xml/transactions_export_20251130.xml
+    # Insert .inprogress.<run_id>.<try> before filename
+    if "/" in final_object:
+        prefix, basename = final_object.rsplit("/", 1)
+        temp_basename = f"{basename}.inprogress.{run_id}.{try_number}"
+        temp_object = f"{prefix}/{temp_basename}"
+    else:
+        basename = final_object
+        temp_object = f"{basename}.inprogress.{run_id}.{try_number}"
+
+    # Acquire BigQuery client
+    bq_hook = BigQueryHook(gcp_conn_id=google_conn_id, use_legacy_sql=False)
+    bq_client = bq_hook.get_client(project_id=project_id)  # google.cloud.bigquery.Client
+
+    # Start the query job
+    query_job = bq_client.query(sql, project=project_id)
+    row_iter = query_job.result(page_size=page_size)  # RowIterator supporting .pages
+
+    # Acquire GCS client & prepare blobs
+    gcs_hook = GCSHook(gcp_conn_id=google_conn_id)
+    storage_client = gcs_hook.get_conn()  # google.cloud.storage.Client
+    bucket = storage_client.bucket(gcs_bucket)
+    final_blob = bucket.blob(final_object)
+    temp_blob = bucket.blob(temp_object)
+
+    # Set desirable chunk size for resumable upload
+    temp_blob.chunk_size = WRITE_BUFFER_SIZE
+
+    try:
+        # Try streaming upload using blob.open("wb")
+        with temp_blob.open("wb") as gcs_file:
+            # XML prolog + root start
+            gcs_file.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
+            gcs_file.write(b"<Rows>\n")
+
+            any_row_written = False
+            for page in row_iter.pages:
+                for row in page:
+                    any_row_written = True
+                    # Build row xml using <Col name="...">value</Col> elements
+                    parts = ["  <Row>"]
+                    # row.items() yields (col, value) pairs in schema order
+                    for col_name, value in row.items():
+                        # Escape attribute and text
+                        # For attribute, escape special xml chars and double quotes -> &quot;
+                        attr_value = xml_escape(str(col_name))
+                        attr_value = attr_value.replace('"', "&quot;")
+                        text_value = _format_value_iso(value)
+                        escaped_text = xml_escape(text_value)
+                        parts.append(f'<Col name="{attr_value}">{escaped_text}</Col>')
+                    parts.append("</Row>\n")
+                    gcs_file.write("".join(parts).encode("utf-8"))
+
+            if not any_row_written:
+                # Optionally write an empty row marker
+                gcs_file.write(b"  <Row />\n")
+
+            # Close root tag
+            gcs_file.write(b"</Rows>\n")
+
+        # Completed writing temp object successfully.
+        # Now copy temp -> final (overwrite final if exists), then delete temp.
+        # Use client's copy_blob(source_blob, destination_bucket, new_name)
+        storage_client.copy_blob(temp_blob, bucket, final_blob.name)
+
+        # Delete the temp blob after successful copy
+        temp_blob.delete()
+
+    except AttributeError:
+        # Fallback path for environments without blob.open("wb").
+        # WARNING: fallback loads all bytes into memory (not streaming). Only acceptable for small datasets.
+        buffer = io.BytesIO()
+        buffer.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
+        buffer.write(b"<Rows>\n")
+        any_row_written = False
+        for page in row_iter.pages:
+            for row in page:
+                any_row_written = True
+                parts = ["  <Row>"]
+                for col_name, value in row.items():
+                    attr_value = xml_escape(str(col_name)).replace('"', "&quot;")
+                    text_value = _format_value_iso(value)
+                    escaped_text = xml_escape(text_value)
+                    parts.append(f'<Col name="{attr_value}">{escaped_text}</Col>')
+                parts.append("</Row>\n")
+                buffer.write("".join(parts).encode("utf-8"))
+        if not any_row_written:
+            buffer.write(b"  <Row />\n")
+        buffer.write(b"</Rows>\n")
+        # upload buffer to temp_blob, then copy to final and delete temp
+        temp_blob.upload_from_string(buffer.getvalue(), content_type="application/xml")
+        storage_client.copy_blob(temp_blob, bucket, final_blob.name)
+        temp_blob.delete()
+
+    # Push final GCS URI into XCom
+    gcs_uri = f"gs://{gcs_bucket}/{final_blob.name}"
+    ti.xcom_push(key="gcs_xml_uri", value=gcs_uri)
+    return gcs_uri
+
+
+with DAG(
+    dag_id="combined_gcs_csv_to_bq_then_bq_to_xml_streaming_safe",
+    default_args=default_args,
+    description="Load CSV from GCS into BigQuery then stream BQ rows to XML safely (temp object -> finalize) and upload to GCS.",
+    schedule_interval=None,
+    start_date=datetime(2025, 1, 1),
+    catchup=False,
+    tags=["gcs", "bigquery", "xml", "etl", "streaming"],
+) as dag:
+
+    # Task 1: load CSV from GCS to BigQuery (no sensor)
+    gcs_to_bq_load = GCSToBigQueryOperator(
+        task_id="gcs_to_bigquery_load",
+        bucket=GCS_INPUT_BUCKET,
+        source_objects=[GCS_INPUT_OBJECT],
+        destination_project_dataset_table=DEST_TABLE,
+        source_format="CSV",
+        skip_leading_rows=1,
+        write_disposition="WRITE_TRUNCATE",      # change to WRITE_APPEND if desired
+        create_disposition="CREATE_IF_NEEDED",
+        autodetect=True,
+        google_cloud_conn_id=GOOGLE_CONN_ID,
+        impersonation_chain=IMPERSONATION_CHAIN,
+    )
+
+    # Task 2: stream BQ -> XML into temp object, finalize to final object, push URI to XCom
+    bq_to_xml_streaming_safe = PythonOperator(
+        task_id="bq_table_to_xml_stream_and_upload_to_gcs_safe",
+        python_callable=stream_bq_to_gcs_xml_safe,
+        op_kwargs={
+            "project_id": PROJECT_ID,
+            "sql": SQL_READ_FROM_BQ,
+            "gcs_bucket": GCS_OUTPUT_BUCKET,
+            "gcs_object_path": f"{GCS_OUTPUT_FOLDER}/{OUTPUT_FILENAME_TPL}",
+            "google_conn_id": GOOGLE_CONN_ID,
+            "impersonation_chain": IMPERSONATION_CHAIN,
+            "page_size": BQ_PAGE_SIZE,
+        },
+        provide_context=True,
+    )
+
+    gcs_to_bq_load >> bq_to_xml_streaming_safe
+
+Notes, permissions, and operational details
+
+Temp object naming & retries
+
+The DAG writes to a unique temp object per run_id and try_number (e.g., transactions_export_20251130.xml.inprogress.manual__2025-12-01T... .2). Retries therefore create separate temp objects and cannot corrupt an already-completed final object.
+
+After successful streaming upload, we copy_blob(temp_blob, bucket, final_name) (this overwrites the final object if already present), then temp_blob.delete().
+
+Permissions needed on GCS output bucket
+
+To create temp object: roles/storage.objectCreator (sufficient).
+
+To copy/delete temp object and overwrite final object: roles/storage.objectAdmin (recommended) or combine objectCreator + objectDeleter capabilities. In many setups, objectAdmin on the output bucket is the simplest least-surprise choice.
+
+Adjust as per your security policy. If you cannot grant delete rights, consider a policy that writes temp to a different bucket and uses a Cloud Function or Cloud Run to finalize with a service account that has delete rights.
+
+Resumable upload & chunk size
+
+blob.open("wb") uses resumable uploads under the hood. Setting blob.chunk_size controls the chunk size for the resumable upload — tune WRITE_BUFFER_SIZE for throughput vs memory. Larger chunk size means fewer network calls but increases memory per chunk.
+
+Atomicity
+
+GCS does not provide an atomic rename. The copy + delete approach is the common pattern to achieve "atomic-ish" finalization. There is a brief moment where both temp and final exist; if you want to ensure consumers only see final when complete, make consumers read only the final path (and optionally verify object size or a success marker).
+
+Formatting
+
+Datetimes/dates are formatted using isoformat() which produces ISO-8601 strings; if you need a specific timezone normalization (e.g., always UTC with Z), convert datetime objects before formatting: v.astimezone(timezone.utc).isoformat().replace('+00:00','Z'). I left it flexible to preserve timezone if present.
+
+XML element naming
+
+All columns are emitted as <Col name="COLUMN_NAME">value</Col> and both attribute and text are XML-escaped. This avoids invalid tag-name problems.
+
+Fallback
+
+If blob.open is unavailable in your google-cloud-storage package, the DAG falls back to building the entire XML in memory and uploading. That fallback will not be memory efficient — upgrade google-cloud-storage (>= 1.20.0 or newer) to enable streaming.
+
+BigQuery types
+
+Complex nested/repeated BigQuery types may require special handling; this streaming approach will call str() on nested structures. If you need to fully expand nested records into nested XML trees, let me know and I’ll add recursive handling (or implement the Avro-export → convert-to-XML approach you mentioned, which is often easier for complex schemas).
+
+Idempotency pattern alternative
+
+Another robust pattern: write to temp/<run_id>/<try> and after success copy to final/<filename>, optionally write a small _SUCCESS marker object. Consumers check for both final file and _SUCCESS to avoid reading partial files.
+
+Would you like me to:
+
+Add timezone normalization to always output timestamps in UTC with Z (ISO-8601 ...Z)?
+
+Add recursive handling for nested RECORD types instead of str()?
+
+Or produce the Avro export → stream Avro→XML variant for fully complex BigQuery schemas?
+
+Pick one and I’ll implement it next.
+
+You said:
+add the safe-temp-object -> finalize rename/copy step to make uploads idempotent for retries, format timestamps in ISO-8601 inside the XML, adapt the XML element naming to use <Col name="...">value</Col> to avoid tag-name restrictions
+ChatGPT said:
+
+Great — below is a single, ready-to-drop-in Airflow DAG that does exactly what you asked:
+
+loads a CSV from a GCS folder into BigQuery (no sensor),
+
+streams BigQuery rows to XML without loading entire resultset,
+
+writes to a unique temp object first, then copies temp → final and deletes temp (idempotent across retries),
+
+emits columns as <Col name="...">value</Col> (avoids invalid XML tag names),
+
+formats datetime/date values as ISO-8601 in UTC with Z (e.g. 2025-12-01T07:30:00Z).
+
+Drop this file into your Airflow dags/ folder and update the USER CONFIG constants at the top.
+
+# combined_gcs_csv_to_bq_then_bq_to_xml_streaming_safe_isoutc.py
+from datetime import datetime, date, timezone, timedelta
+import io
+import typing
+from xml.sax.saxutils import escape as xml_escape
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+
+# === USER CONFIG - change these values ===
+PROJECT_ID = "my-gcp-project-123"
+GCS_INPUT_BUCKET = "my-data-bucket"
+GCS_INPUT_FOLDER = "incoming/finance"
+CSV_FILENAME = "daily_transactions_2025-11-30.csv"
+GCS_INPUT_OBJECT = f"{GCS_INPUT_FOLDER}/{CSV_FILENAME}"
+
+BQ_DATASET = "staging_dataset"
+BQ_TABLE = "transactions_staging"
+DEST_TABLE = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+
+# Output (XML) config
+GCS_OUTPUT_BUCKET = "my-output-bucket"
+GCS_OUTPUT_FOLDER = "exports/xml"
+OUTPUT_FILENAME_TPL = "transactions_export_{{ ds_nodash }}.xml"  # final object name (templated)
+
+# Airflow connection and optional impersonation
+GOOGLE_CONN_ID = "google_cloud_default"
+IMPERSONATION_CHAIN = None  # or ["sa@project.iam.gserviceaccount.com"]
+
+# SQL to read back from BigQuery
+SQL_READ_FROM_BQ = f"SELECT * FROM `{DEST_TABLE}`"
+
+# Controls for streaming
+BQ_PAGE_SIZE = 10_000  # rows per page; tune according to memory/throughput
+WRITE_BUFFER_SIZE = 1024 * 256  # chunk size for resumable upload (bytes). Tune as required.
+
+# DAG args
+default_args = {
+    "owner": "data-engineer",
+    "depends_on_past": False,
+    "retries": 2,
+    "retry_delay": timedelta(minutes=5),
+}
+
+
+def _format_value_iso_utc(v):
+    """
+    Format values for XML text:
+      - datetime -> ISO-8601 in UTC with 'Z' (e.g., 2025-12-01T07:30:00Z)
+      - date -> YYYY-MM-DD
+      - None -> empty string
+      - others -> str()
+    """
+    if v is None:
+        return ""
+    if isinstance(v, datetime):
+        # If naive, assume UTC. If aware, convert to UTC.
+        if v.tzinfo is None:
+            dt_utc = v.replace(tzinfo=timezone.utc)
+        else:
+            dt_utc = v.astimezone(timezone.utc)
+        # Use isoformat then replace +00:00 with Z for compactness
+        return dt_utc.isoformat().replace("+00:00", "Z")
+    if isinstance(v, date) and not isinstance(v, datetime):
+        return v.isoformat()
+    return str(v)
+
+
+def stream_bq_to_gcs_xml_safe_isoutc(
+    *,
+    project_id: str,
+    sql: str,
+    gcs_bucket: str,
+    gcs_object_path: str,
+    google_conn_id: str = "google_cloud_default",
+    impersonation_chain: typing.Optional[list] = None,
+    page_size: int = BQ_PAGE_SIZE,
+    **context,
+) -> str:
+    """
+    Stream BigQuery rows to an XML file in GCS safely:
+      - writes to a unique temp object per run/try,
+      - on success copies temp -> final (overwrite) and deletes temp,
+      - timestamps formatted as ISO-8601 UTC 'Z',
+      - column output format: <Col name="...">value</Col>
+    Returns the final GCS URI and pushes it to XCom.
+    """
+    ti = context["ti"]
+    run_id = context.get("run_id", "manual__" + datetime.utcnow().isoformat())
+    try_number = getattr(ti, "try_number", 1)
+
+    final_object = gcs_object_path  # e.g., exports/xml/transactions_export_20251130.xml
+    # Build temp object name: insert .inprogress.<run_id>.<try> before filename
+    if "/" in final_object:
+        prefix, basename = final_object.rsplit("/", 1)
+        safe_run = run_id.replace("/", "_").replace(":", "_")
+        temp_basename = f"{basename}.inprogress.{safe_run}.{try_number}"
+        temp_object = f"{prefix}/{temp_basename}"
+    else:
+        basename = final_object
+        safe_run = run_id.replace("/", "_").replace(":", "_")
+        temp_object = f"{basename}.inprogress.{safe_run}.{try_number}"
+
+    # BigQuery client via Hook
+    bq_hook = BigQueryHook(gcp_conn_id=google_conn_id, use_legacy_sql=False)
+    bq_client = bq_hook.get_client(project_id=project_id)  # google.cloud.bigquery.Client
+
+    # Start query job
+    query_job = bq_client.query(sql, project=project_id)
+    row_iter = query_job.result(page_size=page_size)  # RowIterator supporting .pages
+
+    # GCS client & blobs
+    gcs_hook = GCSHook(gcp_conn_id=google_conn_id)
+    storage_client = gcs_hook.get_conn()  # google.cloud.storage.Client
+    bucket = storage_client.bucket(gcs_bucket)
+    final_blob = bucket.blob(final_object)
+    temp_blob = bucket.blob(temp_object)
+    temp_blob.chunk_size = WRITE_BUFFER_SIZE
+
+    try:
+        # Try streaming write (preferred)
+        with temp_blob.open("wb") as gcs_file:
+            gcs_file.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
+            gcs_file.write(b"<Rows>\n")
+
+            any_row_written = False
+            for page in row_iter.pages:
+                for row in page:
+                    any_row_written = True
+                    parts = ["  <Row>"]
+                    # row.items() yields (col, val) in schema order
+                    for col_name, value in row.items():
+                        # Attribute and text escaping
+                        attr_value = xml_escape(str(col_name)).replace('"', "&quot;")
+                        text_value = _format_value_iso_utc(value)
+                        escaped_text = xml_escape(text_value)
+                        parts.append(f'<Col name="{attr_value}">{escaped_text}</Col>')
+                    parts.append("</Row>\n")
+                    gcs_file.write("".join(parts).encode("utf-8"))
+
+            if not any_row_written:
+                gcs_file.write(b"  <Row />\n")
+
+            gcs_file.write(b"</Rows>\n")
+
+        # Copy temp -> final (overwrite), then delete temp
+        storage_client.copy_blob(temp_blob, bucket, final_blob.name)
+        temp_blob.delete()
+
+    except AttributeError:
+        # Fallback: no blob.open -> build small chunks in memory (not streaming).
+        # Only acceptable for small datasets; upgrade google-cloud-storage to enable streaming.
+        buffer = io.BytesIO()
+        buffer.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
+        buffer.write(b"<Rows>\n")
+        any_row_written = False
+        for page in row_iter.pages:
+            for row in page:
+                any_row_written = True
+                parts = ["  <Row>"]
+                for col_name, value in row.items():
+                    attr_value = xml_escape(str(col_name)).replace('"', "&quot;")
+                    text_value = _format_value_iso_utc(value)
+                    escaped_text = xml_escape(text_value)
+                    parts.append(f'<Col name="{attr_value}">{escaped_text}</Col>')
+                parts.append("</Row>\n")
+                buffer.write("".join(parts).encode("utf-8"))
+        if not any_row_written:
+            buffer.write(b"  <Row />\n")
+        buffer.write(b"</Rows>\n")
+        temp_blob.upload_from_string(buffer.getvalue(), content_type="application/xml")
+        storage_client.copy_blob(temp_blob, bucket, final_blob.name)
+        temp_blob.delete()
+
+    gcs_uri = f"gs://{gcs_bucket}/{final_blob.name}"
+    ti.xcom_push(key="gcs_xml_uri", value=gcs_uri)
+    return gcs_uri
+
+
+with DAG(
+    dag_id="combined_gcs_csv_to_bq_then_bq_to_xml_streaming_safe_isoutc",
+    default_args=default_args,
+    description="Load CSV from GCS into BigQuery then stream BQ rows to XML safely (temp -> finalize), ISO-8601 UTC timestamps, <Col name=\"...\">value</Col>.",
+    schedule_interval=None,
+    start_date=datetime(2025, 1, 1),
+    catchup=False,
+    tags=["gcs", "bigquery", "xml", "etl", "streaming"],
+) as dag:
+
+    # Task 1: load CSV from GCS to BigQuery (no sensor)
+    gcs_to_bq_load = GCSToBigQueryOperator(
+        task_id="gcs_to_bigquery_load",
+        bucket=GCS_INPUT_BUCKET,
+        source_objects=[GCS_INPUT_OBJECT],
+        destination_project_dataset_table=DEST_TABLE,
+        source_format="CSV",
+        skip_leading_rows=1,
+        write_disposition="WRITE_TRUNCATE",      # change to WRITE_APPEND if desired
+        create_disposition="CREATE_IF_NEEDED",
+        autodetect=True,
+        google_cloud_conn_id=GOOGLE_CONN_ID,
+        impersonation_chain=IMPERSONATION_CHAIN,
+    )
+
+    # Task 2: stream BQ -> XML into temp object, finalize to final object, push URI to XCom
+    bq_to_xml_streaming_safe = PythonOperator(
+        task_id="bq_table_to_xml_stream_and_upload_to_gcs_safe_isoutc",
+        python_callable=stream_bq_to_gcs_xml_safe_isoutc,
+        op_kwargs={
+            "project_id": PROJECT_ID,
+            "sql": SQL_READ_FROM_BQ,
+            "gcs_bucket": GCS_OUTPUT_BUCKET,
+            "gcs_object_path": f"{GCS_OUTPUT_FOLDER}/{OUTPUT_FILENAME_TPL}",
+            "google_conn_id": GOOGLE_CONN_ID,
+            "impersonation_chain": IMPERSONATION_CHAIN,
+            "page_size": BQ_PAGE_SIZE,
+        },
+        provide_context=True,
+    )
+
+    gcs_to_bq_load >> bq_to_xml_streaming_safe
+
+Quick operational notes
+
+IAM: temp + copy + delete require broader GCS rights. For simplicity, grant the Airflow SA roles/storage.objectAdmin on the output bucket (or combine objectCreator, objectViewer, objectDeleter, and objectAdmin as your policy allows).
+
+Streaming: blob.open("wb") (used above) requires a modern google-cloud-storage package. If not available the fallback will build the whole XML in memory — upgrade the client if you expect large tables.
+
+Retries & idempotency: each retry writes to a unique temp object (per run_id & try), so failed attempts won't corrupt an already-successful final object.
+
+Date/times: datetimes are normalized to UTC and formatted with Z. If you want them instead in local timezone or to preserve original timezone offset, tell me and I’ll adjust.
